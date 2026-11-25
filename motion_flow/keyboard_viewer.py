@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if __name__ == '__main__' and not __package__:
     sys.path.insert(0, str(ROOT))
 
-from motion_flow.data import load_clip
+from motion_flow.data import load_clip, rotate_xy
 from motion_flow.online import TrajectoryGenerator
 from motion_flow.robot import DEFAULT_XML, root_quat
 
@@ -25,6 +25,76 @@ DEFAULT_STYLE = ROOT / 'data/pi_plus_motions/walk_hands_on_back_loop_001__A029.n
 KEY_PAIRS = ((glfw.KEY_W, glfw.KEY_S), (glfw.KEY_A, glfw.KEY_D), (glfw.KEY_Q, glfw.KEY_E))
 IDENTITY = np.eye(3).ravel()
 ZERO_SIZE = np.zeros(3)
+
+
+def root_heading(frame):
+    w, x, y, z = frame[3:7]
+    return np.arctan2(2 * (w*z + x*y), 1 - 2 * (y*y + z*z))
+
+
+def measured_twist(previous, current, dt):
+    """Body-frame planar twist over the interval between two emitted root poses."""
+    heading = root_heading(previous)
+    turn = (root_heading(current) - heading + np.pi) % (2*np.pi) - np.pi
+    # In a turn, the world displacement is a chord centered on the mid-step heading.
+    local = rotate_xy(current[:2] - previous[:2], -heading - turn/2)
+    velocity = local / (dt * np.sinc(turn / (2*np.pi)))
+    return np.array([velocity[0], velocity[1], turn / dt])
+
+
+class VelocityPlots:
+    def __init__(self, fps):
+        self.seconds = 10.
+        self.figures = []
+        for title in ('Forward vx (m/s)', 'Lateral vy (m/s)', 'Yaw rate (rad/s)'):
+            fig = mujoco.MjvFigure()
+            fig.title = title
+            fig.xlabel = 'Time (s)'
+            fig.xformat, fig.yformat = '%.1f', '%.2f'
+            fig.gridsize[:] = (5, 3)
+            fig.flg_extend = 0
+            fig.flg_legend = 0
+            fig.linergb[:2] = [[1., .68, .24], [.25, .85, .95]]
+            fig.linewidth = 2.
+            self.figures.append(fig)
+        capacity = min(round(self.seconds * fps) + 1, self.figures[0].linedata.shape[1] // 2)
+        self.samples = deque(maxlen=capacity)
+        self.marker_stride = max(1, round(.5 * fps))
+
+    def append(self, timestamp, command, measured):
+        self.samples.append((timestamp, *command, *measured))
+
+    def draw(self, width, height, context):
+        samples = np.asarray(self.samples)
+        times = samples[:, 0]
+        end = max(self.seconds, times[-1])
+        count = len(samples)
+        legend_height = min(32, height // 5)
+        for i, label in enumerate(('Command', 'Measured from root pose')):
+            left = width * i // 2
+            rect = mujoco.MjrRect(left, height - legend_height, width * (i+1) // 2 - left, legend_height)
+            mujoco.mjr_label(rect, mujoco.mjtFont.mjFONT_NORMAL, label, .07, .10, .12, 1.,
+                             *self.figures[0].linergb[i], context)
+        for axis, fig in enumerate(self.figures):
+            values = samples[:, [axis + 1, axis + 4]]
+            low, high = min(0., values.min()), max(0., values.max())
+            pad = max(.05, .25 * (high - low))
+            fig.range[:] = ((end - self.seconds, end), (low - pad, high + pad))
+            fig.linepnt[:2] = count
+            fig.linedata[:2, :2*count:2] = times
+            fig.linedata[:2, 1:2*count:2] = values.T
+            left = axis * width // 3
+            rect = mujoco.MjrRect(left, 0, (axis+1)*width//3 - left, height - legend_height)
+            mujoco.mjr_figure(rect, fig, context)
+            # Mark measured samples so both series remain visible at exact agreement.
+            xp, yp = fig.xaxispixel, fig.yaxispixel
+            if xp[1] <= xp[0] or yp[1] <= yp[0]:
+                continue
+            for i in range(count-1, -1, -self.marker_stride):
+                x = np.interp(times[i], fig.xaxisdata, xp)
+                y = np.interp(values[i, 1], fig.yaxisdata, yp)
+                mujoco.mjr_rectangle(mujoco.MjrRect(round(x)-2, round(y)-2, 5, 5),
+                                     *fig.linergb[1], 1.)
 
 
 def adjust_command(command, key, steps):
@@ -79,8 +149,8 @@ class SplitView:
             if button not in (glfw.MOUSE_BUTTON_LEFT, glfw.MOUSE_BUTTON_RIGHT):
                 return
             if action == glfw.PRESS:
-                drag_button = button
                 last_x, last_y = glfw.get_cursor_pos(window)
+                drag_button = button if last_y < glfw.get_window_size(window)[1] * 2/3 else None
             elif button == drag_button:
                 drag_button = None
 
@@ -88,7 +158,7 @@ class SplitView:
             nonlocal last_x, last_y
             if drag_button is None:
                 return
-            height = max(1, glfw.get_window_size(window)[1])
+            height = max(1, glfw.get_window_size(window)[1] * 2/3)
             dx, dy = (x - last_x) / height, (y - last_y) / height
             last_x, last_y = x, y
             camera = self.camera
@@ -103,7 +173,8 @@ class SplitView:
                 self.pan_offset += span * (dy * up - dx * right)
 
         def on_scroll(window, xoffset, yoffset):
-            self.camera.distance = max(.02, self.camera.distance * .90 ** yoffset)
+            if glfw.get_cursor_pos(window)[1] < glfw.get_window_size(window)[1] * 2/3:
+                self.camera.distance = max(.02, self.camera.distance * .90 ** yoffset)
 
         glfw.set_mouse_button_callback(window, on_button)
         glfw.set_cursor_pos_callback(window, on_motion)
@@ -138,6 +209,7 @@ def run_viewer(window, view, generator, clip, style_name, speed_step):
     colors = (np.array([.26, .82, 1., 1.], dtype='f'), np.array([1., .66, .15, 1.], dtype='f'))
     ticks = 0
     period = 1. / generator.fps
+    plots = VelocityPlots(generator.fps)
     cmd = np.zeros(3)
 
     def on_key(window, key, scancode, action, mods):
@@ -167,7 +239,10 @@ def run_viewer(window, view, generator, clip, style_name, speed_step):
         # Advance on the motion clock. Bound catch-up after long window-system stalls.
         deadline = max(deadline, now - 3 * period)
         while deadline <= now:
+            previous = generated
             generated = generator.step(cmd)
+            measured = measured_twist(previous, generated, period)
+            plots.append((ticks + 1) * period, cmd, measured)
             index = (index + 1) % len(reference)
             if index == 0:
                 trails[0].clear()
@@ -178,15 +253,18 @@ def run_viewer(window, view, generator, clip, style_name, speed_step):
             deadline += period
 
         width, height = glfw.get_framebuffer_size(window)
-        if width >= 2 and height > 0:
+        if width >= 3 and height >= 3:
             mid = width // 2
-            left = mujoco.MjrRect(0, 0, mid, height)
-            right = mujoco.MjrRect(mid, 0, width-mid, height)
+            plot_height = height // 3
+            left = mujoco.MjrRect(0, plot_height, mid, height - plot_height)
+            right = mujoco.MjrRect(mid, plot_height, width-mid, height - plot_height)
             view.draw(left, reference[index], trails[0], colors[0], 'Style reference',
                       f'{style_name}\nFrame {index+1} / {len(reference)}')
             view.draw(right, generated, trails[1], colors[1], 'Live flow matching',
-                      f'vx {cmd[0]:+.2f} m/s    vy {cmd[1]:+.2f} m/s    wz {cmd[2]:+.2f} rad/s\n'
+                      f'Cmd  vx {cmd[0]:+.3f}   vy {cmd[1]:+.3f}   wz {cmd[2]:+.3f}\n'
+                      f'Root  vx {measured[0]:+.3f}   vy {measured[1]:+.3f}   wz {measured[2]:+.3f}\n'
                       'Tap W/S: vx +/-    A/D: vy +/-    Q/E: wz +/-\nSpace: zero speeds    Esc: quit')
+            plots.draw(width, plot_height, view.context)
             glfw.swap_buffers(window)
 
 
@@ -207,7 +285,7 @@ def main():
     if not glfw.init():
         raise SystemExit('Cannot initialize GLFW. Run the viewer in a graphical desktop session.')
     try:
-        window = glfw.create_window(1200, 640, 'Pi Plus | Style reference and live flow matching', None, None)
+        window = glfw.create_window(1200, 780, 'Pi Plus | Style reference and live flow matching', None, None)
         if not window:
             raise SystemExit('Cannot create the MuJoCo OpenGL window.')
         glfw.make_context_current(window)
