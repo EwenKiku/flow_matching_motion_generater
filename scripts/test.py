@@ -44,7 +44,7 @@ class ConfigTests(unittest.TestCase):
             robot = Robot(robot_spec.xml, robot_spec.joints, robot_spec.bodies, robot_spec.anchor_body)
             self.assertEqual(robot.model.nq, len(robot_spec.joints) + 7)
             self.assertEqual(robot_spec.train.save_interval, 5000)
-            self.assertGreaterEqual(robot_spec.train.flow_weight, 0)
+            self.assertGreaterEqual(robot_spec.train.pose_weight, 0)
             self.assertGreaterEqual(robot_spec.train.slip_weight, 0)
 
     def test_viewer_scene_loads_both_models(self):
@@ -227,7 +227,7 @@ class AlgorithmTests(unittest.TestCase):
         net = MotionFlow(cfg)
         stance = StanceSlip(spec.xml, spec.joints, spec.anchor_body, spec.foot, spec.fps)
         loss = net.loss(*(torch.as_tensor(array) for array in batch), stance=stance,
-                        flow_weight=spec.train.flow_weight, slip_weight=spec.train.slip_weight,
+                        pose_weight=spec.train.pose_weight, slip_weight=spec.train.slip_weight,
                         style_speed=torch.as_tensor(speed))
         self.assertTrue(torch.isfinite(loss))
         loss.backward()

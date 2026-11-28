@@ -72,6 +72,9 @@ class MotionFlow(nn.Module):
         basis = basis / (1 + mode) ** 1.5
         self.register_buffer('basis', basis)
         self.register_buffer('inverse', torch.linalg.pinv(basis))
+        # Per-coefficient moments. Training fills these so each mode matches unit noise.
+        self.register_buffer('coeff_mean', torch.zeros(cfg.modes, cfg.channels))
+        self.register_buffer('coeff_std', torch.ones(cfg.modes, cfg.channels))
         self.style_in = nn.Linear(dim * 2, width)
         self.register = nn.Parameter(torch.randn(1, 1, width) * .02)
         self.style_encoder = encoder(cfg, 2)
@@ -100,11 +103,31 @@ class MotionFlow(nn.Module):
         delta = torch.diff(pose, dim=1, prepend=pose[:, :1])
         return torch.cat((pose, 5 * delta), -1)
 
+    @staticmethod
+    def posture(style, valid):
+        return (style * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)
+
+    def baseline(self, past, posture):
+        """Straight blend from the last history pose to the style's average posture."""
+        pose = past[..., :self.cfg.channels]
+        fraction = torch.arange(1, self.cfg.future + 1, device=pose.device, dtype=pose.dtype) / self.cfg.future
+        return pose[:, -1:] + fraction[None, :, None] * (posture[:, None] - pose[:, -1:])
+
+    def residual_coefficients(self, past, style, valid, future):
+        """Least-squares sine coefficients of the future, before noise alignment."""
+        past = self.normalize_history(past)
+        style, future = self.normalize(style), self.normalize(future)
+        return self.inverse @ (future - self.baseline(past, self.posture(style, valid)))
+
+    def reconstruct(self, coeff, baseline):
+        """Normalized pose restored from whitened coefficients."""
+        return baseline + self.basis @ (coeff * self.coeff_std + self.coeff_mean)
+
     def encode_style(self, style, valid, speed=None):
         # Extract phase-independent posture and dynamics. Tokens are spaced by 4 frames.
         # `speed` is the style window's own root speed. Dividing the frame delta by it
         # removes the recorded cadence, so the path can carry a different command speed.
-        mean = (style * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)
+        mean = self.posture(style, valid)
         samples = style[:, ::4]
         if speed is None:
             features = self.with_delta(samples)
@@ -138,10 +161,7 @@ class MotionFlow(nn.Module):
         cmd = self.path_in(torch.cat((knots, twist * (self.cfg.fps / 3)), -1))
         cmd = cmd + self.positions[2:self.cfg.future:3]
         style_token = self.style_inject(embedding * math.sqrt(self.cfg.width))
-        # Center the residual around a gradual move toward the reference's average posture.
-        fraction = torch.arange(1, self.cfg.future+1, device=past.device) / self.cfg.future
-        baseline = past[:, -1:] + fraction[None, :, None] * (posture[:, None] - past[:, -1:])
-        return torch.cat((style_token[:, None], h, cmd), 1), baseline
+        return torch.cat((style_token[:, None], h, cmd), 1), self.baseline(past, posture)
 
     def velocity(self, x, t, context, style_bias=0.):
         modes = self.mode_in(x) + self.positions[:self.cfg.modes]
@@ -152,34 +172,28 @@ class MotionFlow(nn.Module):
             bias = x.new_zeros(tokens.size(1), tokens.size(1))
             bias[:, 0] = style_bias
         encoded = self.generator(tokens, mask=bias)
-        # Analytic velocity of a unit Gaussian interpolant plus a learned residual.
-        skip = (2*t - 1) / (t.square() + (1-t).square())
-        return skip[:, None, None] * x + self.readout(encoded[:, -self.cfg.modes:])
+        return self.readout(encoded[:, -self.cfg.modes:])
 
-    def loss(self, past, style, valid, path, future, stance=None, flow_weight=1., slip_weight=0.,
+    def loss(self, past, style, valid, path, future, stance=None, pose_weight=1., slip_weight=0.,
              style_speed=None, ref_anchor=None, drift_weight=0.):
-        weights = (flow_weight, slip_weight, drift_weight)
+        weights = (pose_weight, slip_weight, drift_weight)
         if min(weights) < 0 or not all(math.isfinite(weight) for weight in weights):
             raise ValueError('loss weights must be nonnegative and finite')
         past = self.normalize_history(past)
         style, future = self.normalize(style), self.normalize(future)
         # Supervise each pose on the measured root trajectory that produced it.
         context, baseline = self.context(past, path, self.encode_style(style, valid, style_speed))
-        target = self.inverse @ (future - baseline)
+        target = (self.inverse @ (future - baseline) - self.coeff_mean) / self.coeff_std
         noise = torch.randn_like(target)
         t = torch.rand(len(past), device=past.device)
         state = torch.lerp(noise, target, t[:, None, None])
         velocity = self.velocity(state, t, context)
-        error = (velocity - (target - noise)).square()
-        # Emphasize the low modes responsible for stride and gross pose.
-        mode_weights = torch.arange(1, self.cfg.modes+1, device=state.device).rsqrt()
-        flow = flow_weight * (error * (mode_weights / mode_weights.mean())[None, :, None]).mean()
-        slip = flow.new_zeros(())
-        drift = flow.new_zeros(())
+        restored = self.reconstruct(state + (1 - t)[:, None, None] * velocity, baseline)
+        pose_loss = pose_weight * (restored - future).square().mean()
+        slip = pose_loss.new_zeros(())
+        drift = pose_loss.new_zeros(())
         if stance is not None and (slip_weight or drift_weight):
-            # One-step estimate of the clean future the generator is currently proposing.
-            clean = state + (1 - t)[:, None, None] * velocity
-            pose = (baseline + self.basis @ clean) * self.scale + self.mean
+            pose = restored * self.scale + self.mean
             anchor = past[:, -1, :self.cfg.channels] * self.scale + self.mean
             reference = future * self.scale + self.mean
             velocity_loss, displacement = stance.terms(
@@ -188,9 +202,9 @@ class MotionFlow(nn.Module):
             slip = slip_weight * velocity_loss
             drift = drift_weight * displacement
         self.last_drift = drift.detach()
-        self.last_flow = flow.detach()
+        self.last_pose = pose_loss.detach()
         self.last_slip = slip.detach()
-        return flow + slip + drift
+        return pose_loss + slip + drift
 
     @torch.inference_mode()
     def sample(self, past, path, style, steps, style_bias=0., rng=None):
@@ -202,4 +216,4 @@ class MotionFlow(nn.Module):
         for i in range(steps):
             t = x.new_full((len(x),), i / steps)
             x = x + self.velocity(x, t, context, style_bias) / steps
-        return (baseline + self.basis @ x) * self.scale + self.mean
+        return self.reconstruct(x, baseline) * self.scale + self.mean

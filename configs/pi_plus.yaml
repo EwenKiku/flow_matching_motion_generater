@@ -95,7 +95,7 @@ train:
   val_fraction: 0.05
   val_batches: 16
   # 各项损失的系数。日志里的同名分项已经乘过这里的权重。
-  flow_weight: 1
+  pose_weight: 1
   slip_weight: 1
   arm_mix_prob: 0
   pattern:

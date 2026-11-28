@@ -15,7 +15,7 @@ MODEL_KEYS = ('history', 'future', 'modes', 'width', 'layers', 'heads', 'style_s
 INFER_KEYS = ('steps', 'stride', 'style_bias', 'replan_delta')
 TRAIN_KEYS = ('steps', 'batch_size', 'lr', 'seed', 'log_interval', 'threads', 'max_clips',
               'save_interval', 'val_fraction', 'val_batches',
-              'flow_weight', 'slip_weight', 'drift_weight', 'arm_mix_prob', 'generated_history_prob', 'pattern')
+              'pose_weight', 'slip_weight', 'drift_weight', 'arm_mix_prob', 'generated_history_prob', 'pattern')
 FOOT_KEYS = ('bodies', 'sole_point', 'contact_height')
 VIEWER_KEYS = ('title', 'distance', 'lookat_height', 'elevation', 'azimuth_offset', 'speed_step')
 TOP_KEYS = ('name', 'xml', 'motions', 'checkpoint', 'default_style', 'anchor_body', 'fps',
@@ -59,7 +59,7 @@ class TrainSpec:
     save_interval: int
     val_fraction: float
     val_batches: int
-    flow_weight: float
+    pose_weight: float
     drift_weight: float
     slip_weight: float
     generated_history_prob: float
@@ -267,7 +267,7 @@ def _load_file(path):
         save_interval=_positive(train_raw['save_interval'], f'{path}: train.save_interval', int),
         val_fraction=_number(train_raw['val_fraction'], f'{path}: train.val_fraction'),
         val_batches=_positive(train_raw['val_batches'], f'{path}: train.val_batches', int),
-        flow_weight=_number(train_raw['flow_weight'], f'{path}: train.flow_weight'),
+        pose_weight=_number(train_raw['pose_weight'], f'{path}: train.pose_weight'),
         drift_weight=_number(train_raw['drift_weight'], f'{path}: train.drift_weight'),
         slip_weight=_number(train_raw['slip_weight'], f'{path}: train.slip_weight'),
         generated_history_prob=_number(train_raw['generated_history_prob'], 'train.generated_history_prob'),
@@ -278,7 +278,7 @@ def _load_file(path):
         raise ValueError("generated_history_prob must lie in [0, 1]")
     if not 0 <= train.arm_mix_prob <= 1:
         raise ValueError(f'{path}: train.arm_mix_prob must lie in [0, 1]')
-    loss_weights = (train.flow_weight, train.slip_weight, train.drift_weight)
+    loss_weights = (train.pose_weight, train.slip_weight, train.drift_weight)
     if min(loss_weights) < 0 or not all(math.isfinite(weight) for weight in loss_weights):
         raise ValueError(f'{path}: loss weights must be nonnegative')
     if train.max_clips < 0:

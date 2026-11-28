@@ -32,6 +32,30 @@ def batch_tensors(clips, batch_size, cfg, rng, device, **sampling):
     return arrays, torch.as_tensor(speed, device=device)
 
 
+def calibrate_coefficients(net, clips, batch_size, cfg, rng, device, arm_mix_prob, batches=32):
+    """Match each sine coefficient to unit noise using training windows only."""
+    count = 0
+    total = square = None
+    was_training = net.training
+    net.eval()
+    try:
+        for _ in range(batches):
+            (past, style, valid, _, future), _ = batch_tensors(
+                clips, batch_size, cfg, rng, device, augment=True, arm_mix_prob=arm_mix_prob)
+            with torch.no_grad():
+                coeff = net.residual_coefficients(past, style, valid, future)
+            count += coeff.shape[0]
+            total = coeff.sum(0) if total is None else total + coeff.sum(0)
+            square = coeff.square().sum(0) if square is None else square + coeff.square().sum(0)
+    finally:
+        net.train(was_training)
+    mean = total / count
+    std = (square / count - mean.square()).clamp(min=0).sqrt().clamp(min=1e-3)
+    net.coeff_mean.copy_(mean)
+    net.coeff_std.copy_(std)
+    return std
+
+
 def continuation_batch(net, arrays, speed, infer):
     """Commit one sampled stride and express the next GT path in its own anchor frame."""
     past, style, valid, path, future = arrays
@@ -71,7 +95,7 @@ def evaluate(net, clips, batch_size, batches, cfg, rng, stance, train, device):
         for _ in range(batches):
             arrays, speed = batch_tensors(clips, batch_size, cfg, rng, device)
             with torch.no_grad():
-                value = net.loss(*arrays, stance=stance, style_speed=speed, flow_weight=train.flow_weight, slip_weight=train.slip_weight, drift_weight=train.drift_weight)
+                value = net.loss(*arrays, stance=stance, style_speed=speed, pose_weight=train.pose_weight, slip_weight=train.slip_weight, drift_weight=train.drift_weight)
             total += value.item()
     finally:
         torch.set_rng_state(cpu_rng)
@@ -167,6 +191,9 @@ def main():
     net.mean.copy_(torch.from_numpy(mean))
     net.scale.copy_(torch.from_numpy(np.maximum(variance**.5, .025)))
     net.to(args.device)
+    coeff_std = calibrate_coefficients(net, train_clips, batch_size, cfg, np.random.default_rng(seed + 3),
+                                       args.device, train.arm_mix_prob)
+    print(f'coefficient std {coeff_std.min().item():.3f}..{coeff_std.max().item():.3f}', flush=True)
     stance = StanceSlip(spec.xml, spec.joints, spec.anchor_body, spec.foot, spec.fps).to(args.device)
     opt = torch.optim.AdamW(net.parameters(), lr=lr)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, eta_min=lr * .1)
@@ -187,7 +214,7 @@ def main():
         ref_anchor = None
         if continuation:
             arrays, ref_anchor = continuation_batch(net, arrays, speed, spec.infer)
-        loss = net.loss(*arrays, ref_anchor=ref_anchor, stance=stance, style_speed=speed, flow_weight=train.flow_weight, slip_weight=train.slip_weight, drift_weight=train.drift_weight)
+        loss = net.loss(*arrays, ref_anchor=ref_anchor, stance=stance, style_speed=speed, pose_weight=train.pose_weight, slip_weight=train.slip_weight, drift_weight=train.drift_weight)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1., error_if_nonfinite=True)
@@ -198,7 +225,7 @@ def main():
         if step == 1 or step % log_interval == 0 or step == steps:
             mean_loss = running / (step - last_log_step)
             print(f'step {step}/{steps} ({100 * step / steps:.1f}%) | '
-                  f'loss {current_loss:.4f} | flow {net.last_flow.item():.4f} | '
+                  f'loss {current_loss:.4f} | pose {net.last_pose.item():.4f} | '
                   f'foot {net.last_slip.item():.4f} | drift {net.last_drift.item():.4f} | '
                   f'mean_loss {mean_loss:.4f}', flush=True)
             last_log_step = step
@@ -206,7 +233,7 @@ def main():
         if step % train.save_interval == 0 or step == steps:
             payload = dict(config=asdict(cfg), model=net.state_dict(), joints=spec.joints,
                            bodies=spec.bodies, robot=spec.name, step=step, seed=seed,
-                           flow_weight=train.flow_weight, slip_weight=train.slip_weight,
+                           pose_weight=train.pose_weight, slip_weight=train.slip_weight,
                            drift_weight=train.drift_weight, arm_mix_prob=train.arm_mix_prob,
                            generated_history_prob=train.generated_history_prob,
                            pattern=list(pattern), clips=len(train_clips), val_clips=len(val_clips))
