@@ -1,0 +1,111 @@
+# RP1（24 自由度）。动作来自 reactor_mjlab 导出的重定向轨迹。
+# https://github.com/EwenKiku/reactor_mjlab
+name: rp1
+xml: robots/rp1/mjcf/robot_24dof.xml
+motions: data/rp1
+checkpoint: checkpoints/rp1.pt
+default_style: data/rp1/arc_walk_left_loop_001__A029.npz
+anchor_body: base_link
+fps: 50
+
+joints:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_roll_joint
+  - waist_yaw_joint
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_joint
+
+# 与 reactor 导出 NPZ 的 body_names 一致。Head 与 Chest 都对应 waist_yaw_link。
+bodies:
+  - base_link
+  - waist_yaw_link
+  - waist_yaw_link
+  - left_shoulder_roll_link
+  - left_shoulder_yaw_link
+  - left_elbow_link
+  - left_wrist_link
+  - right_shoulder_roll_link
+  - right_shoulder_yaw_link
+  - right_elbow_link
+  - right_wrist_link
+  - left_hip_yaw_link
+  - left_knee_link
+  - left_ankle_roll_link
+  - right_hip_yaw_link
+  - right_knee_link
+  - right_ankle_roll_link
+
+# 足底点在踝滚转坐标系。中心碰撞胶囊 x 为 -0.0825..0.1275，中点 0.0225；
+# 胶囊中心 z=-0.035、半径 0.01，足底在 z=-0.045。
+# contact_height 以下视为支撑。支撑脚损失的系数在 train.slip_weight。
+feet:
+  bodies:
+    - left_ankle_roll_link
+    - right_ankle_roll_link
+  sole_point: [0.0225, 0.0, -0.045]
+  sole_half_length: 0.105
+  contact_height: 0.025
+
+viewer:
+  title: RP1 | 风格参考与实时流匹配
+  distance: 2.6
+  lookat_height: 0.62
+  elevation: -16
+  azimuth_offset: 130
+  speed_step: [0.05, 0.05, 0.10]
+
+model:
+  root_residual: true
+  link_history: true
+  history: 15
+  future: 30
+  modes: 8
+  width: 96
+  layers: 3
+  heads: 4
+  style_seconds: 5
+
+infer:
+  steps: 5
+  stride: 20
+  style_bias: 1.0
+  replan_delta: 0.15
+
+train:
+  steps: 500000
+  batch_size: 64
+  lr: 0.0004
+  seed: 42
+  log_interval: 100
+  threads: 4
+  max_clips: 0
+  save_interval: 5000
+  val_fraction: 0.05
+  val_batches: 16
+  # 各项损失的系数。日志里的同名分项已经乘过这里的权重。
+  flow_weight: 5
+  slip_weight: 10
+  drift_weight: 100
+  generated_history_prob: 0.25
+  arm_mix_prob: 0.2
+  pattern:
+    - "*.npz"

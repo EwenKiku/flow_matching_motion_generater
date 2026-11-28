@@ -1,120 +1,127 @@
-# Pi Plus 风格条件流匹配轨迹生成器
+# 风格条件流匹配轨迹生成
 
-给定一段 Pi Plus 风格动作和每帧的速度指令 `(vx, vy, wz)`，生成器以 50 Hz 输出浮动基座位姿和 22 个关节角。风格参考可以在运行中切换。仓库包含可直接推理的权重 `checkpoints/pi_plus_walk.pt`。
+给定一条机器人参考动作和每帧速度指令 `(vx, vy, wz)`，生成器以 50 Hz 输出浮动基座位姿和全部铰链关节角。风格参考可以在运行中切换。同一套流匹配网络同时支持 RP1 和 Pi Plus，机器人差异放在 `configs/` 里，默认是 RP1。
 
-[9 秒对照视频](examples/style_switch.mp4) 左侧播放风格参考，右侧从同一条连续生成的轨迹取帧。在第 3 秒切换为背手走并左转，第 6 秒切换为蹲走并改变侧向和转向速度。[对应的 450 帧轨迹](examples/style_switch.npz) 可以直接读取。
+动作数据来自 [reactor_mjlab](https://github.com/EwenKiku/reactor_mjlab) 导出的重定向轨迹。当前仓库里的 `data/rp1` 就是这批 RP1 结果。Pi Plus 的导出放到 `data/pi_plus` 后，用 `--robot pi_plus` 训练和生成。
+
+## 目录
+
+| 路径 | 内容 |
+| --- | --- |
+| `motion_flow/` | 流匹配网络、训练采样、滚动生成、支撑脚损失 |
+| `configs/rp1.yaml`、`configs/pi_plus.yaml` | 模型、关节顺序、足端几何、训练和推理参数 |
+| `scripts/train.py` | 训练 |
+| `scripts/generate.py` | 按速度指令导出一段 NPZ |
+| `scripts/keyboard_viewer.py` | 键盘实时对照 |
+| `scripts/test.py` | 配置和算法检查 |
+| `data/rp1` | reactor_mjlab 的 RP1 重定向 NPZ |
+| `robots/` | 两台机器人的 MJCF |
+
+换机器人时改配置，不改网络代码。YAML 里的路径相对仓库根目录。`joints` 是网络通道顺序，加载时按关节名重排 NPZ。`feet.sole_point` 是踝滚转坐标系里的足底点，训练时用它惩罚支撑脚滑动。RP1 的训练损失分别监督足跟和前掌。
+
+## 环境
+
+在仓库根目录运行。依赖写在 `requirements.txt`，配置加载需要其中的 PyYAML。
+
+```bash
+conda activate flow_matching
+python -m pip install -r requirements.txt
+```
+
+本机驱动是 550.144.03（CUDA 12.4），显卡是 RTX 3090。`requirements.txt` 把 PyTorch 固定为 `2.14.1+cu126`，这个构建可以在当前驱动上调用 GPU。CUDA 13 的轮子会报驱动过旧。训练不写 `--device` 时，检测到 CUDA 就用 GPU。
+
+## 训练
+
+```bash
+python scripts/train.py --robot rp1 --data data/rp1
+python scripts/train.py --robot pi_plus --data data/pi_plus --device cuda
+```
+
+不写 `--robot` 时使用 `configs/rp1.yaml`：读取 `data/rp1`，权重写到 `checkpoints/rp1.pt`。步数、批大小、学习率和片段通配都在配置的 `train` 段，命令行同名参数会盖过它们。`--max-clips 0` 表示使用全部够长的片段。
+
+```bash
+python scripts/train.py --robot rp1 --pattern 'walk*.npz' --max-clips 3600 --steps 10000 --device cuda
+```
+
+权重里会记下机器人名、关节顺序和刚体名单。生成时如果和当前配置对不上，会直接拒绝加载。默认每 5000 步保存一次当前权重，并用 5% 的片段做验证；固定验证片段的闭环足部位置 RMSE 创新低时写入同目录的 `best.pt`。
+
+## 生成
+
+```bash
+python scripts/generate.py --style data/rp1/arc_walk_left_loop_001__A029.npz \
+  --command 0.30 0.00 0.35 --seconds 6 --out /tmp/rp1_turn.npz
+```
+
+速度依次是当前朝向下的前进速度（m/s）、向左速度（m/s）和绕世界竖直轴的角速度（rad/s）。把 `--command` 和 `--seconds` 换成 `--commands commands.csv` 可以回放变化的指令。CSV 无表头，每行三个分量，行数就是输出长度。
+
+导出的就是流模型这一帧的姿态，没有足端后处理。ODE 步数、重规划间隔和风格偏置在配置的 `infer` 段。
+
+输出 NPZ 与 reactor 导出使用同一套字段：`fps`、`joint_names`、`body_names`、`joint_pos`、`joint_vel`，以及世界系刚体位姿和速度。四元数是 `wxyz`。
 
 ## 键盘实时对照
 
-在有图形桌面的机器上，从仓库根目录启动 MuJoCo 双视口窗口。
+在服务器本机的图形桌面上直接运行。从另一台电脑看时，用 `ssh -X` 登录后再运行同一条命令。转发过来的屏幕没有可用的 OpenGL，查看器会在服务器 GPU 上画好，再把画面送到你当前的屏幕。
 
 ```bash
-conda activate reactor
-python motion_flow/keyboard_viewer.py
+ssh -X kiku@192.168.10.186
+conda activate flow_matching
+python scripts/keyboard_viewer.py --robot rp1 --style data/rp1/alone_R_002__A187.npz
 ```
 
-左侧循环播放默认的背手步行参考，右侧使用同一段参考和当前速度指令实时生成动作。启动时三个速度分量均为零。每点按一次调整一档，松开后保持该速度。两侧地面的蓝线和橙线显示各自最近的根轨迹，右侧底部显示当前指令。
+在服务器自己的桌面上运行时，仍然打开原来的 OpenGL 窗口。`ssh -X` 进来时，画面改由 GPU 画好后送到你当前的屏幕，左右两侧都会标出正在使用的风格名，下方是最近 10 秒的指令速度和机器人根速度。
 
-窗口底部三张曲线图分别对比前向速度、侧向速度（m/s）和偏航角速度（rad/s）。橙色为该步指令，青色为从相邻两帧输出根位姿反算的速度。青色方点在两线重合时仍可见。横轴是轨迹时间，保留最近 10 秒，在每个控制步末记录同一时间戳的一对样本。转弯时按机体朝向换算平移速度，并处理偏航角跨越 ±π。当前生成器直接积分指令得到平面根轨迹，因此两线通常重合。这组图衡量运动学根轨迹的速度，足底滑移和动力学跟踪需要单独评估。
+左侧循环播放风格参考，右侧用同一段参考和当前速度指令实时生成。启动时三个速度分量都是零。点按一次改一档，松开后保持。窗口失去焦点时指令归零。左右方向键在同一目录里切换风格，切换后左侧参考和右侧生成都显示新的名字。
 
-在任一视口按住鼠标左键拖动可旋转视角，右键拖动可平移，滚轮向上拉近、向下拉远。左右视口同步调整，松开鼠标后各自以调整后的视角继续跟随机器人。
-
-| 按键 | 右侧机器人的速度指令 |
+| 按键 | 作用 |
 | --- | --- |
-| W / S | 前进速度增加 / 减少 0.05 m/s |
-| A / D | 向左速度增加 / 减少 0.05 m/s |
-| Q / E | 左转角速度增加 / 减少 0.10 rad/s |
-| 空格 | 所有速度立即归零，松开后保持零 |
+| W / S | 前进速度增加 / 减少一档 |
+| A / D | 向左速度增加 / 减少一档 |
+| Q / E | 左转角速度增加 / 减少一档 |
+| 空格 | 三个速度立即归零 |
+| ← / → | 切换上一条 / 下一条风格 |
 | Esc | 退出 |
 
-例如从零连续点十次 W，前进速度会保持在 0.50 m/s。再点一次 S 减到 0.45 m/s，点一次 Q 就会边前进边左转。三个速度分量都按点按次数向正负方向累加。窗口失去焦点时指令归零。用 `--style` 选择参考片段，用 `--speed-step` 设置每次点按的增量。
+每档的大小在配置的 `viewer.speed_step`，也可以用 `--speed-step 0.05 0.05 0.10` 覆盖。鼠标左键旋转、右键平移、滚轮缩放，两个视口同步。
 
-```bash
-python -m motion_flow.keyboard_viewer \
-  --style data/pi_plus_motions/crouch_ff_loop_360_003__A125.npz \
-  --speed-step 0.05 0.03 0.10
-```
+底部曲线是前向速度、侧向速度和偏航角速度。橙色是指令，青色是相邻两帧根位姿反算的速度。转弯时按机体朝向换算平移速度，并处理偏航角跨越 ±π。新 RP1 权重会在积分路径上预测骨盆偏移，曲线可反映步态引起的瞬时速度差。这组图不评估足底滑移和动力学跟踪。
 
-## 生成一段动作
-
-在仓库根目录运行。当前机器的 `reactor` Conda 环境包含所需依赖。新环境可用 `python -m pip install -r requirements.txt` 安装。
-
-```bash
-conda activate reactor
-python -m motion_flow.generate \
-  --checkpoint checkpoints/pi_plus_walk.pt \
-  --style data/pi_plus_motions/walk_hands_on_back_loop_001__A029.npz \
-  --command 0.30 0.00 0.35 --seconds 6 --out /tmp/styled_walk.npz
-```
-
-该例生成一段背手向左转弯的步行轨迹。速度指令依次为当前朝向下的前进速度（m/s）、向左速度（m/s）和绕世界竖直轴向左的角速度（rad/s）。如需回放变化的指令，将 `--command ... --seconds ...` 替换为 `--commands commands.csv`。CSV 无表头，每行是一个控制周期的三个分量，行数决定输出长度。
-
-输出 NPZ 与 `data/pi_plus_motions` 使用相同字段，包括 `fps`、`joint_names`、`body_names`、`joint_pos`、`joint_vel`、世界坐标系下的刚体位置、姿态、线速度和角速度。导出通过 Pi Plus MJCF 计算各连杆的正运动学，四元数采用 `wxyz`。
-
-## 接入实时控制循环
+## 接入控制循环
 
 ```python
 import torch
-from motion_flow.online import TrajectoryGenerator
+from scripts.config import load_robot, make_generator
 
-torch.set_num_threads(1)  # 单机器人 CPU 推理
-generator = TrajectoryGenerator(
-    "checkpoints/pi_plus_walk.pt",
-    "data/pi_plus_motions/walk_ff_loop_360_003__A049.npz",
+torch.set_num_threads(1)
+spec = load_robot('rp1')  # 或 'pi_plus'
+generator = make_generator(
+    spec,
+    spec.checkpoint,
+    'data/rp1/arc_walk_left_loop_001__A029.npz',
+    device='cpu',
     seed=42,
 )
-
-# 在 50 Hz 循环内，每个周期用最新的速度调用一次
 qpos = generator.step((0.30, 0.00, 0.35))
 root_xyz, root_wxyz, joint_pos = qpos[:3], qpos[3:7], qpos[7:]
-joint_names = generator.robot.joints
-
-# 切换风格时调用一次，下一个周期按新风格重规划
-generator.set_style("data/pi_plus_motions/crouch_ff_loop_360_003__A125.npz")
-qpos = generator.step((0.20, 0.05, 0.10))
+generator.set_style('data/rp1/arc_walk_left_loop_001__A030.npz')
 ```
 
-`step` 每次将时间推进一个采样周期，调用方负责调度。初始化默认取风格片段的前 15 帧作为历史，也可以用 `initial_clip=` 单独指定起始动作。与仿真或现有控制器连接时，可用 `generator.reset(history)` 设置世界系起始历史。每行按 `[xyz, wxyz, joint_pos]` 排列，关节顺序见 `generator.robot.joints`，历史从旧到新，短历史在开头复制首帧。低层跟踪器可以消费这些运动学参考，接触力、平衡和执行器力矩需要由低层控制器处理。
+`step` 每次推进一个采样周期，调用方负责按 50 Hz 调度。`set_style` 不重置根轨迹，下一个周期按新风格重规划。关节顺序是配置里的 `joints`，也就是 `generator.robot.joints`。
 
-根轨迹在每一帧响应新指令。姿态默认每 10 帧重规划，任一指令分量相对上次规划变化超过 0.15 或切换风格时提前重规划。前 3 帧与旧窗口剩余部分混合。`steps` 控制流 ODE 的 Euler 步数，默认 5。`style_bias` 是施加到风格 token 上的注意力加数，默认 1。缓存风格和加载模型在控制循环外完成。
-
-默认启用 Pi Plus 平地足部修正。它根据足底中点距地面（世界系 `z=0`）的高度估计支撑权重，累积有界的水平防滑偏移，通过阻尼逆运动学修正输出关节。流模型保持自身滚动历史。需要原始流模型输出，或场景地形不同，可以传入 `stabilize_feet=False`。
+根轨迹每帧都跟着新指令走。姿态默认每 `infer.stride` 帧重规划；任一指令分量相对上次规划变化超过 `infer.replan_delta`，或切换风格时提前重规划。流模型保持自己的滚动历史。播放时直接使用模型输出的姿态。
 
 ## 训练方法
 
-实现采用本地论文 `docs/walk_like_this.pdf` 第 4 节和附录 A.1 的风格双采样、历史差分、朝向坐标系、风格注意力偏置和重叠滚动生成。扩散去噪替换为条件直线流匹配。
+实现对应 `docs/walk_like_this.pdf` 第 4 节和附录 A.1 的风格双采样、历史差分、朝向坐标系、风格注意力偏置和重叠滚动生成。扩散去噪换成条件直线流匹配。
 
-1. 从同一动作抽取 15 帧历史、随后 30 帧目标，以及独立抽取的 1–5 秒风格片段。长度允许时使用互不重叠的窗口。风格编码器每 4 帧取样，通过 register token 汇总姿态及其差分，输出单位范数嵌入。较长参考在推理时分段编码并按时长聚合。
-2. 模型的输出变量包括根高度、横滚、俯仰和各铰链关节角。先减去从当前姿态向风格平均姿态过渡的基线，再将未来窗口投影到 8 个从零位移起步的低频正弦模态。截断高频也会削弱动作中的快速细节。
-3. 令目标系数为 `a`，采样高斯噪声 `e` 和均匀流时间 `t`。在 `(1-t)e + ta` 上回归速度 `a-e`，按模态加权均方误差，联合训练生成器与风格编码器。条件包括风格、历史姿态及差分、未来平面路径和速度。
-4. 训练时混合实测根路径与连接相同端点的平滑恒速转弯路径，使网络也能学习手柄式输入。推理时在 SE(2) 上积分实时速度，直接确定根平移和航向，再由流模型生成相应的全身姿态。关节角按 MJCF 的限位裁剪。根路径的跟踪精度由积分决定，步态质量和足底滑移需单独评估。
+1. 从同一条动作里取一段历史和紧接着的未来，再另取 1 到 `style_seconds` 秒的风格片段。风格编码器每 4 帧取样，用 register token 汇总姿态和差分，输出单位范数嵌入。更长的参考在推理时分段编码后按时长加权。
+2. 网络预测根高度、横滚、俯仰和各铰链角。先减去从当前姿态走向风格平均姿态的基线，再把未来窗口投影到从零位移起步的低频正弦模态。
+3. 令目标系数为 `a`，采样噪声 `e` 和流时间 `t`，在 `(1-t)e + ta` 上回归速度 `a-e`。条件包括风格、历史、未来平面路径和速度。
+4. RP1 训练把实测根路径分成平滑指令路径与局部骨盆偏移。推理时在 SE(2) 上积分指令，再叠加网络预测的水平位移和偏航。
+5. 训练用参考足底高度计算支撑权重，支撑时惩罚水平滑动，摆动时匹配参考三维速度。总目标由流匹配和足部运动两项组成。
+6. RP1 训练以 `arm_mix_prob` 的概率组合其他片段的手臂动作；验证使用原始轨迹。
 
-复现随附基线的训练命令如下。按文件名匹配后去重，以种子 42 抽取 3,600 个片段。目录中太短的片段会跳过。
+检查配置和一轮前向：
 
 ```bash
-python motion_flow/train.py --data data/pi_plus_motions \
-  --pattern '*walk*.npz' 'crouch_ff*.npz' 'jog_ff*.npz' 'idle*.npz' \
-  --max-clips 3600 --steps 10000 --batch-size 48 --device cuda \
-  --out checkpoints/pi_plus_walk.pt
+python scripts/test.py
 ```
-
-训练整个目录时省略 `--pattern` 和 `--max-clips`。加载器根据关节名对齐通道，根据 `body_names` 定位 `base_link`，支持标记为 `wxyz` 或 `xyzw` 的四元数。一个模型的训练片段和在线参考须具有同一骨架和采样率。当前权重针对 Pi Plus。
-
-用 `--log-interval N` 设置打印间隔，默认每 100 步打印，第 1 步和最后一步也会打印。每行显示当前步数、总步数、完成百分比、当前批次的 `loss` 和自上次打印以来的 `mean_loss`。加载数据期间会显示已读取的文件数。
-
-运行回归检查可使用 `python -m unittest discover -s tests -v`。
-
-## 基线实测
-
-最终权重使用 3,599 条有效动作（1,466,491 帧）训练了 10,000 步。下表的三条参考文件均未被本次训练抽中，同类动作可能出现在训练集中。三次生成均使用普通步行片段作为起始历史、随机种子 123 和前进 0.30 m/s 指令。每次生成 10 秒，统计后 8 秒。
-
-| 风格参考 | 参考 / 生成平均根高度（m） | 平均关节姿态误差¹（rad） | 低位脚踝水平速度²（m/s） |
-| --- | --- | --- | --- |
-| 普通步行 `walk_ff_loop_360_003__A049` | 0.359 / 0.356 | 0.041 | 0.108 |
-| 背手步行 `walk_hands_on_back_loop_001__A029` | 0.365 / 0.363 | 0.048 | 0.098 |
-| 蹲姿步行 `crouch_ff_loop_360_003__A125` | 0.278 / 0.281 | 0.100 | 0.243 |
-
-¹ 对每个关节分别计算生成和参考片段的时间均值，再取 22 个绝对差的平均值。该指标衡量静态姿态风格。步态节奏可在视频中检查。  
-² 对两脚分别取脚踝高度最低四分之一的帧，统计世界系水平速度，用作足滑近似指标。关闭足部修正时三项分别为 0.165、0.192、0.307 m/s。蹲走在这个指令下仍有明显滑移。
-
-在本机 Intel Core Ultra 9 275HX、PyTorch CPU 单线程、5 个 Euler 步条件下，预热后 144 次重规划帧耗时的 P95 为 4.54 ms（含单帧足部修正）。测量范围为 `step()`，风格编码、文件导出和底层控制器单独执行。变化指令测试覆盖前进、侧移、反向、转弯和停止。验证范围为运动学参考生成及 MuJoCo 正运动学，动力学跟踪和实机表现仍待验证。

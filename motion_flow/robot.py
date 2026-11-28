@@ -1,10 +1,6 @@
-from pathlib import Path
-
 import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
-
-DEFAULT_XML = Path(__file__).resolve().parents[1] / 'robots/pi_plus/xmls/pi_plus.xml'
 
 
 def root_quat(roll, pitch, yaw):
@@ -13,19 +9,23 @@ def root_quat(roll, pitch, yaw):
 
 
 class Robot:
-    def __init__(self, xml, joints, bodies):
+    """Floating-base kinematics for one configured skeleton. Joint order is the checkpoint order."""
+
+    def __init__(self, xml, joints, bodies, anchor_body='base_link'):
         self.model = mujoco.MjModel.from_xml_path(str(xml))
         self.joints, self.bodies = tuple(joints), tuple(bodies)
+        self.anchor_body = anchor_body
+        self.model.body(anchor_body)
         self.address = [self.model.joint(n).qposadr.item() for n in joints]
         if self.model.nq != len(joints) + 7 or set(self.address) != set(range(7, self.model.nq)):
-            raise ValueError('Expected a floating base followed by named hinge joints')
+            raise ValueError('Expected a floating base followed by the configured hinge joints')
         self.body_ids = [self.model.body(n).id for n in bodies]
         ranges = [self.model.joint(n).range if self.model.joint(n).limited.item()
                   else [-np.inf, np.inf] for n in joints]
         self.low, self.high = np.asarray(ranges).T
 
     def save(self, output, frames, fps):
-        """Export the same retarget NPZ schema as the input, with world-frame FK and velocities."""
+        """Export the reactor retarget NPZ schema, with world-frame FK and velocities."""
         frames = np.asarray(frames)
         if frames.ndim != 2 or frames.shape[1] != 7 + len(self.joints) or len(frames) == 0:
             raise ValueError('Expected a nonempty trajectory in checkpoint joint order')
@@ -51,7 +51,7 @@ class Robot:
             return np.gradient(x, axis=0) * fps if len(x) > 1 else np.zeros_like(x)
 
         np.savez_compressed(output, fps=np.array([fps], dtype='f'), joint_names=self.joints,
-                            body_names=self.bodies, anchor_body='base_link', quaternion_order='wxyz',
+                            body_names=self.bodies, anchor_body=self.anchor_body, quaternion_order='wxyz',
                             joint_pos=frames[:, 7:].astype('f'), joint_vel=velocity(frames[:, 7:]).astype('f'),
                             body_pos_w=pos.astype('f'), body_quat_w=quat.astype('f'),
                             body_lin_vel_w=velocity(pos).astype('f'), body_ang_vel_w=ang.astype('f'))

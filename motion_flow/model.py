@@ -16,6 +16,18 @@ class Config:
     width: int = 96
     layers: int = 3
     heads: int = 4
+    # Longest style window. Training samples inside it; inference encodes the reference in chunks of this length.
+    style_seconds: float = 5.
+    history_links: list | None = None
+    root_residual: bool = False
+
+    @property
+    def channels(self):
+        return self.dof + 3 + (3 if self.root_residual else 0)
+
+
+# Style frame-deltas are divided by root speed. This floor keeps a stand from exploding.
+STYLE_SPEED_FLOOR = 0.15
 
 
 def sincos(time, width):
@@ -50,7 +62,7 @@ class MotionFlow(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        dim, width = cfg.dof + 3, cfg.width
+        dim, width = cfg.channels, cfg.width
         self.register_buffer('mean', torch.zeros(dim))
         self.register_buffer('scale', torch.ones(dim))
         # Anchored sine modes give zero displacement at frame zero and a free endpoint.
@@ -63,6 +75,10 @@ class MotionFlow(nn.Module):
         self.style_in = nn.Linear(dim * 2, width)
         self.register = nn.Parameter(torch.randn(1, 1, width) * .02)
         self.style_encoder = encoder(cfg, 2)
+        if cfg.history_links:
+            from .history import LinkHistory
+            self.link_fk = LinkHistory(cfg.history_links)
+            self.link_in = nn.Linear(9 * (1 + len(cfg.history_links)), width)
         self.history_in = nn.Linear(dim * 2, width)
         self.path_in = nn.Linear(7, width)
         self.mode_in = nn.Linear(dim, width)
@@ -75,16 +91,28 @@ class MotionFlow(nn.Module):
     def normalize(self, pose):
         return (pose - self.mean) / self.scale
 
+    def normalize_history(self, past):
+        pose = self.normalize(past[..., :self.cfg.channels])
+        return torch.cat((pose, past[..., self.cfg.channels:]), -1) if self.cfg.history_links else pose
+
     @staticmethod
     def with_delta(pose):
         delta = torch.diff(pose, dim=1, prepend=pose[:, :1])
         return torch.cat((pose, 5 * delta), -1)
 
-    def encode_style(self, style, valid):
+    def encode_style(self, style, valid, speed=None):
         # Extract phase-independent posture and dynamics. Tokens are spaced by 4 frames.
+        # `speed` is the style window's own root speed. Dividing the frame delta by it
+        # removes the recorded cadence, so the path can carry a different command speed.
         mean = (style * valid[..., None]).sum(1) / valid.sum(1, keepdim=True)
         samples = style[:, ::4]
-        tokens = self.style_in(self.with_delta(samples))
+        if speed is None:
+            features = self.with_delta(samples)
+        else:
+            delta = torch.diff(samples, dim=1, prepend=samples[:, :1])
+            denom = speed.reshape(-1).to(device=samples.device, dtype=samples.dtype)
+            features = torch.cat((samples, 5 * delta / denom.clamp(min=STYLE_SPEED_FLOOR)[:, None, None]), -1)
+        tokens = self.style_in(features)
         tokens = tokens + sincos(torch.arange(tokens.size(1), device=style.device), self.cfg.width)
         tokens = torch.cat((self.register.expand(len(style), -1, -1), tokens), 1)
         mask = F.pad(~valid[:, ::4], (1, 0), value=False)
@@ -92,8 +120,13 @@ class MotionFlow(nn.Module):
         return embedding, mean
 
     def context(self, past, path, style):
+        if self.cfg.history_links:
+            track = past[..., self.cfg.channels:]
+            past = past[..., :self.cfg.channels]
         embedding, posture = style
         h = self.history_in(self.with_delta(past)) + self.positions[:past.size(1)]
+        if self.cfg.history_links:
+            h = h + self.link_in(self.link_fk(past * self.scale + self.mean, track, self.cfg.root_residual))
         if self.training:
             h = h * (torch.rand(len(h), 1, 1, device=h.device) >= .15)
         knots = path[:, 2::3]
@@ -123,36 +156,48 @@ class MotionFlow(nn.Module):
         skip = (2*t - 1) / (t.square() + (1-t).square())
         return skip[:, None, None] * x + self.readout(encoded[:, -self.cfg.modes:])
 
-    def loss(self, past, style, valid, path, future):
-        past, style, future = [self.normalize(a) for a in (past, style, future)]
-        # A joystick gives smooth intent, while measured root paths include gait sway.
-        # Mix measured paths with constant body twists joining the same SE(2) endpoints.
-        fraction = torch.arange(1, self.cfg.future+1, device=path.device) / self.cfg.future
-        turn = torch.atan2(path[:, -1:, 2], 1-path[:, -1:, 3])
-        angle = turn * fraction
-        half_diff = (angle - turn) / 2
-        x, y = path[:, -1:, 0], path[:, -1:, 1]
-        ratio = fraction * torch.sinc(angle/(2*math.pi)) / torch.sinc(turn/(2*math.pi))
-        smooth = torch.stack((ratio*(x*half_diff.cos()-y*half_diff.sin()),
-                              ratio*(x*half_diff.sin()+y*half_diff.cos()),
-                              angle.sin(), 1-angle.cos()), dim=-1)
-        path = torch.where(torch.rand(len(path), 1, 1, device=path.device) < .7, smooth, path)
-        context, baseline = self.context(past, path, self.encode_style(style, valid))
+    def loss(self, past, style, valid, path, future, stance=None, flow_weight=1., slip_weight=0.,
+             style_speed=None, ref_anchor=None, drift_weight=0.):
+        weights = (flow_weight, slip_weight, drift_weight)
+        if min(weights) < 0 or not all(math.isfinite(weight) for weight in weights):
+            raise ValueError('loss weights must be nonnegative and finite')
+        past = self.normalize_history(past)
+        style, future = self.normalize(style), self.normalize(future)
+        # Supervise each pose on the measured root trajectory that produced it.
+        context, baseline = self.context(past, path, self.encode_style(style, valid, style_speed))
         target = self.inverse @ (future - baseline)
         noise = torch.randn_like(target)
         t = torch.rand(len(past), device=past.device)
-        x = torch.lerp(noise, target, t[:, None, None])
-        error = (self.velocity(x, t, context) - (target - noise)).square()
+        state = torch.lerp(noise, target, t[:, None, None])
+        velocity = self.velocity(state, t, context)
+        error = (velocity - (target - noise)).square()
         # Emphasize the low modes responsible for stride and gross pose.
-        weights = torch.arange(1, self.cfg.modes+1, device=x.device).rsqrt()
-        return (error * (weights / weights.mean())[None, :, None]).mean()
+        mode_weights = torch.arange(1, self.cfg.modes+1, device=state.device).rsqrt()
+        flow = flow_weight * (error * (mode_weights / mode_weights.mean())[None, :, None]).mean()
+        slip = flow.new_zeros(())
+        drift = flow.new_zeros(())
+        if stance is not None and (slip_weight or drift_weight):
+            # One-step estimate of the clean future the generator is currently proposing.
+            clean = state + (1 - t)[:, None, None] * velocity
+            pose = (baseline + self.basis @ clean) * self.scale + self.mean
+            anchor = past[:, -1, :self.cfg.channels] * self.scale + self.mean
+            reference = future * self.scale + self.mean
+            velocity_loss, displacement = stance.terms(
+                pose, anchor, reference, anchor if ref_anchor is None else ref_anchor,
+                path, path, drift=bool(drift_weight))
+            slip = slip_weight * velocity_loss
+            drift = drift_weight * displacement
+        self.last_drift = drift.detach()
+        self.last_flow = flow.detach()
+        self.last_slip = slip.detach()
+        return flow + slip + drift
 
     @torch.inference_mode()
     def sample(self, past, path, style, steps, style_bias=0., rng=None):
         if steps < 1:
             raise ValueError('steps must be positive')
-        context, baseline = self.context(self.normalize(past), path, style)
-        x = torch.randn((len(past), self.cfg.modes, past.size(-1)), device=past.device,
+        context, baseline = self.context(self.normalize_history(past), path, style)
+        x = torch.randn((len(past), self.cfg.modes, self.cfg.channels), device=past.device,
                         generator=rng)
         for i in range(steps):
             t = x.new_full((len(x),), i / steps)

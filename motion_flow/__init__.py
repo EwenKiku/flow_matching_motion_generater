@@ -1,1 +1,1 @@
-"""Example-conditioned flow matching for robot reference trajectories."""
+"""Conditional flow matching for retargeted robot reference trajectories."""

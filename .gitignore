@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.data
+.idea
+.cursor
+.vscode
